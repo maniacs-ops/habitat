@@ -27,6 +27,7 @@ use std::str::FromStr;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
+use hab_core::crypto;
 use hab_core::package::archive::PackageArchive;
 use hab_core::package::install::PackageInstall;
 use hab_core::package::PackageIdent;
@@ -100,14 +101,19 @@ pub struct Runner {
     workspace: Workspace,
     auth_token: String,
     logger: Option<Logger>,
+    depot_cli: depot_client::Client,
 }
 
 impl Runner {
     pub fn new(job: Job, config: &Config) -> Self {
+        let depot_cli =
+            depot_client::Client::new(&hab_core::url::default_depot_url(), PRODUCT, VERSION, None)
+                .unwrap();
         Runner {
             auth_token: config.auth_token.clone(),
             workspace: Workspace::new(config.data_path.clone(), job),
             logger: None,
+            depot_cli: depot_cli,
         }
     }
 
@@ -128,15 +134,28 @@ impl Runner {
             error!("WORKSPACE SETUP ERR={:?}", err);
             return self.fail();
         }
-        // JW TODO: How are we going to get the secret keys for this thing?
+        match self.depot_cli.fetch_origin_secret_key(self.job().origin(), &self.auth_token) {
+            Ok(key) => {
+                let cache = crypto::default_cache_key_path(None);
+                let (pair, pair_type) = try!(crypto::SigKeyPair::write_file_from_str(content,
+                                                                                     cache));
+                debug!("Imported {} origin key {}.",
+                       &pair_type,
+                       &pair.name_with_rev());
+            }
+            Err(err) => {
+                error!("Unable to retrieve secret key, err={}", err);
+                return self.fail();
+            }
+        }
         if let Some(err) = self.job().vcs().clone(&self.workspace.src()).err() {
-            error!("CLONE ERROR={}", err);
+            error!("Unable to clone remote source repository, err={}", err);
             return self.fail();
         }
         let mut archive = match self.build() {
             Ok(archive) => archive,
             Err(err) => {
-                error!("STUDIO ERR={}", err);
+                error!("Unable to build in studio, err={}", err);
                 return self.fail();
             }
         };
@@ -204,13 +223,10 @@ impl Runner {
         // JW TODO: In the future we'll support multiple and configurable post processors, but for
         // now let's just publish to the public depot
         //
-        // Things to solve right now
-        // * Where do we get the token for authentication?
-        //      * Should the workers ask for a lease from the JobSrv?
-        let client =
-            depot_client::Client::new(&hab_core::url::default_depot_url(), PRODUCT, VERSION, None)
-                .unwrap();
-        if let Some(err) = client.x_put_package(archive, &self.auth_token).err() {
+        // JW TODO: We need to modify the upload endpoint to allow a token with the proper
+        // privileges to upload and not just members of the origin since the workers will not be
+        // a member of the origin they are uploading to.
+        if let Some(err) = self.depot_cli.x_put_package(archive, &self.auth_token).err() {
             error!("post processing error, ERR={:?}", err);
         }
         if let Some(err) = fs::remove_dir_all(self.workspace.out()).err() {
